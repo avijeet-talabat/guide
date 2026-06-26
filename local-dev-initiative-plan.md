@@ -94,28 +94,45 @@ Make it available to all teams and drive adoption.
 
 ## Architecture
 
-```
-Developer Machine                          QA Cluster (EKS)
-┌─────────────────────┐                   ┌──────────────────────────┐
-│                     │                   │  discovery namespace     │
-│  tlbctl dev start   │                   │                          │
-│       │             │                   │  ┌────────────────────┐  │
-│       ▼             │                   │  │ home-api-gateway   │  │
-│  ┌──────────┐       │    mirrord        │  │ pod (3 containers) │  │
-│  │ mirrord  │───────┼──────────────────▶│  │  - app             │  │
-│  │ layer    │       │    agent pod      │  │  - istio-proxy     │  │
-│  └────┬─────┘       │                   │  │  - opa sidecar     │  │
-│       │             │                   │  └────────────────────┘  │
-│       ▼             │                   │                          │
-│  ┌──────────┐       │  traffic mirror   │  ┌────────────────────┐  │
-│  │ go run   │◀──────┼──────────────────▶│  │ mirrord-agent pod  │  │
-│  │ main.go  │       │                   │  └────────────────────┘  │
-│  └──────────┘       │                   │                          │
-│   Local code        │  outbound calls   │  ┌────────────────────┐  │
-│   with changes      │─────────────────▶ │  │ downstream svcs    │  │
-│                     │  (via pod network) │  │ (*.svc.cluster)    │  │
-└─────────────────────┘                   │  └────────────────────┘  │
-                                          └──────────────────────────┘
+```mermaid
+graph TB
+    subgraph local["🖥️ Developer Machine"]
+        cli["tlbctl dev start &lt;service&gt;"]
+        cli --> mirrord_layer["mirrord layer"]
+        mirrord_layer --> app["Local process<br/>(go run main.go)"]
+        app --- local_code["Local code with changes<br/>+ local config files"]
+    end
+
+    subgraph cluster["☁️ QA Cluster (EKS eu-west-2)"]
+        subgraph ns["discovery namespace"]
+            subgraph pod["Target Pod (3 containers)"]
+                app_container["app container<br/>home-api-gateway"]
+                istio["istio-proxy<br/>(envoy sidecar)"]
+                opa["OPA/STS sidecar<br/>(auth)"]
+            end
+            agent["mirrord-agent pod<br/>(privileged, auto-created)"]
+
+            subgraph downstream["Downstream Services"]
+                fwf["fwf-client-api<br/>(shared ns)"]
+                discovery_svc["discovery-service"]
+                loyalty["loyalty-api<br/>(growth ns)"]
+                pps["personalisation-platform<br/>(search-discovery ns)"]
+                va["vendor-availability<br/>(gRPC)"]
+            end
+        end
+    end
+
+    mirrord_layer -- "① creates agent pod" --> agent
+    agent -- "② mirrors incoming traffic" --> app
+    app -- "③ outbound calls<br/>(via pod network)" --> downstream
+    agent -- "④ DNS resolution<br/>(*.svc.cluster.local)" --> app
+    agent -. "reads env vars" .-> pod
+
+    style local fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style cluster fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style pod fill:#fff3e0,stroke:#ef6c00,stroke-width:1px
+    style downstream fill:#fce4ec,stroke:#c62828,stroke-width:1px
+    style agent fill:#f3e5f5,stroke:#7b1fa2,stroke-width:1px
 ```
 
 ---
