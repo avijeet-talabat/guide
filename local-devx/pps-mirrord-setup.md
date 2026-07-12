@@ -10,17 +10,18 @@
 ## 1. Prerequisites
 
 - Install mirrord: `brew install metalbear-co/mirrord/mirrord`
-- AWS credentials via saml2aws: `saml2aws login -a tlb-dev-2`
 - kubectl + optionally [kubectx/kubens](https://github.com/ahmetb/kubectx)
 - **Cloudflare WARP must be DISABLED** (conflicts with VPN needed to reach private EKS endpoint)
 
 ## 2. AWS Authentication
 
+You must explicitly assume the `search-discovery` IAM role. Using `saml2aws login -a tlb-dev-2` alone gives you the `discovery` role, which **does not** have `jobs.batch` permissions in the `search-discovery` namespace (mirrord needs this to deploy its agent).
+
 ```bash
-saml2aws login -a tlb-dev-2
+saml2aws login -a tlb-dev-2 --role arn:aws:iam::690772145391:role/search-discovery --force
 ```
 
-This authenticates via Okta and stores temporary AWS credentials for account `690772145391` (discovery role). Credentials expire after ~12 hours.
+This authenticates via Okta and stores temporary AWS credentials for the `search-discovery` role. Credentials expire after ~12 hours.
 
 ## 3. kubectl Context & Namespace Setup
 
@@ -56,6 +57,10 @@ kubens search-discovery
 ```bash
 kubectl get deployments
 # Should show: personalisation-platform-service
+
+# Verify you have the right permissions:
+kubectl auth can-i create jobs.batch -n search-discovery
+# Should print: yes
 ```
 
 ## 4. mirrord Configuration
@@ -80,7 +85,7 @@ Create `.mirrord/mirrord.json` in the project root (already gitignored):
     }
   },
   "agent": {
-    "namespace": "discovery",
+    "namespace": "search-discovery",
     "privileged": true
   },
   "kube_context": "arn:aws:eks:eu-west-2:690772145391:cluster/talabat-qa-eks-az-2a-cluster"
@@ -106,8 +111,8 @@ The service starts on port `8080`. mirrord duplicates incoming QA traffic to you
 ## 6. How to Stop & Cleanup
 
 1. `Ctrl+C` the mirrord process (agent pod auto-deletes)
-2. Verify: `kubectl get pods -n discovery | grep mirrord`
-3. Manual cleanup if needed: `kubectl delete pod -n discovery -l app=mirrord`
+2. Verify: `kubectl get pods -n search-discovery | grep mirrord`
+3. Manual cleanup if needed: `kubectl delete pod -n search-discovery -l app=mirrord`
 
 ## 7. Key Findings & Known Limitations
 
@@ -117,12 +122,14 @@ Excluding `DH_SPEC_FILE` triggers the Talabat config path (`config/config.yml`).
 
 ### b) Agent namespace permissions ✅ RESOLVED
 
-The `discovery` IAM role (used via `saml2aws login -a tlb-dev-2`) does **not** have permission to create `jobs.batch` in `search-discovery`. Set `agent.namespace` to `"discovery"` where the role does have batch permissions. mirrord can run its agent in a different namespace than the target — it attaches to the target pod's network via the node, not via namespace.
+mirrord deploys its agent as a `jobs.batch` resource. The `discovery` IAM role (default for `tlb-dev-2`) does **not** have this permission in `search-discovery`. You must explicitly assume the `search-discovery` role:
 
 ```bash
-# Verify permissions before running:
-kubectl auth can-i create jobs.batch -n discovery   # should print: yes
-kubectl auth can-i create jobs.batch -n search-discovery  # prints: no
+# Wrong — gives discovery role, lacks jobs.batch in search-discovery:
+saml2aws login -a tlb-dev-2
+
+# Correct — explicitly assumes search-discovery role:
+saml2aws login -a tlb-dev-2 --role arn:aws:iam::690772145391:role/search-discovery --force
 ```
 
 ### c) DNS resolution ✅
@@ -160,6 +167,6 @@ istio intercepts traffic before mirrord can inspect HTTP headers. Filtered steal
 | `feature.network.dns` | `true` | Resolve `*.svc.cluster.local` via remote DNS |
 | `feature.fs` | `"local"` | Use local filesystem |
 | `feature.env.exclude` | `"DH_SPEC_FILE"` | Force fallback to local `config/config.yml` |
-| `agent.namespace` | `"discovery"` | Namespace where discovery IAM role has batch/jobs permissions |
+| `agent.namespace` | `"search-discovery"` | Namespace where search-discovery IAM role has batch/jobs permissions |
 | `agent.privileged` | `true` | Required for DNS resolution on hardened clusters |
 | `kube_context` | `arn:aws:eks:...` | Explicit QA cluster context |
