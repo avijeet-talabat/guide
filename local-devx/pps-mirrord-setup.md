@@ -79,7 +79,10 @@ Create `.mirrord/mirrord.json` in the project root (already gitignored):
       "outgoing": true,
       "dns": true
     },
-    "fs": "local",
+    "fs": {
+      "mode": "local",
+      "read_only": ["/var/run/secrets"]
+    },
     "env": {
       "exclude": "DH_SPEC_FILE"
     }
@@ -92,13 +95,23 @@ Create `.mirrord/mirrord.json` in the project root (already gitignored):
 }
 ```
 
-### Why `exclude: "DH_SPEC_FILE"` instead of `include + override`
+### Config design decisions
+
+#### `exclude: "DH_SPEC_FILE"` (not `include + override`)
 
 `main.go` checks for `DH_SPEC_FILE` at startup:
 - **Present** → reads GDP spec file at that path (used in deployed pods, path doesn't exist locally)
 - **Absent** → falls back to `config/config.yml` (local Talabat config)
 
 Excluding `DH_SPEC_FILE` makes the local process use the local config automatically. Note: you **cannot** use both `include` and `exclude` for env vars in mirrord — use one or the other.
+
+#### `fs.read_only: ["/var/run/secrets"]` (IRSA token)
+
+The service uses AWS IRSA (IAM Roles for Service Accounts) for S3 and DynamoDB access. The pod has env vars `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN` that point to a projected token at `/var/run/secrets/eks.amazonaws.com/serviceaccount/token`. This file only exists inside the pod.
+
+With `fs.mode: "local"` alone, the AWS SDK tries to read this token locally and fails. Adding `read_only: ["/var/run/secrets"]` tells mirrord to read that path from the **remote pod's filesystem**, giving the local process the same IRSA credentials as the deployed service.
+
+Without this, the service crashes at startup with a fatal error in `s3/cacheds3.go:83` because S3 cache loading fails.
 
 ## 5. How to Run
 
@@ -132,13 +145,13 @@ saml2aws login -a tlb-dev-2
 saml2aws login -a tlb-dev-2 --role arn:aws:iam::690772145391:role/search-discovery --force
 ```
 
-### c) DNS resolution ✅
+### c) IRSA credentials (S3/DynamoDB) ✅ RESOLVED
+
+The pod uses IRSA tokens mounted at `/var/run/secrets/eks.amazonaws.com/serviceaccount/token`. With `fs: "local"` this file doesn't exist, causing a fatal crash in `s3/cacheds3.go:83`. Fixed by adding `read_only: ["/var/run/secrets"]` to read the token from the remote pod.
+
+### d) DNS resolution ✅
 
 Set `agent.privileged: true` and `dns: true`. The cluster is hardened; without privileges the agent cannot perform DNS lookups for `*.svc.cluster.local` addresses.
-
-### d) Filesystem mode ✅
-
-Set `fs: "local"` — config files are loaded via env var fallback, no remote filesystem access needed.
 
 ### e) STS/OPA sidecar auth ❌ NOT RESOLVED
 
@@ -165,7 +178,8 @@ istio intercepts traffic before mirrord can inspect HTTP headers. Filtered steal
 | `feature.network.incoming` | `"mirror"` | Safe mode — duplicates traffic |
 | `feature.network.outgoing` | `true` | Route outbound calls through pod's network |
 | `feature.network.dns` | `true` | Resolve `*.svc.cluster.local` via remote DNS |
-| `feature.fs` | `"local"` | Use local filesystem |
+| `feature.fs.mode` | `"local"` | Use local filesystem by default |
+| `feature.fs.read_only` | `["/var/run/secrets"]` | Read IRSA token from remote pod for AWS auth |
 | `feature.env.exclude` | `"DH_SPEC_FILE"` | Force fallback to local `config/config.yml` |
 | `agent.namespace` | `"search-discovery"` | Namespace where search-discovery IAM role has batch/jobs permissions |
 | `agent.privileged` | `true` | Required for DNS resolution on hardened clusters |
