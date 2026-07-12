@@ -80,7 +80,7 @@ Create `.mirrord/mirrord.json` in the project root (already gitignored):
     }
   },
   "agent": {
-    "namespace": "search-discovery",
+    "namespace": "discovery",
     "privileged": true
   },
   "kube_context": "arn:aws:eks:eu-west-2:690772145391:cluster/talabat-qa-eks-az-2a-cluster"
@@ -106,8 +106,8 @@ The service starts on port `8080`. mirrord duplicates incoming QA traffic to you
 ## 6. How to Stop & Cleanup
 
 1. `Ctrl+C` the mirrord process (agent pod auto-deletes)
-2. Verify: `kubectl get pods -n search-discovery | grep mirrord`
-3. Manual cleanup if needed: `kubectl delete pod -n search-discovery -l app=mirrord`
+2. Verify: `kubectl get pods -n discovery | grep mirrord`
+3. Manual cleanup if needed: `kubectl delete pod -n discovery -l app=mirrord`
 
 ## 7. Key Findings & Known Limitations
 
@@ -115,9 +115,15 @@ The service starts on port `8080`. mirrord duplicates incoming QA traffic to you
 
 Excluding `DH_SPEC_FILE` triggers the Talabat config path (`config/config.yml`). No additional env overrides needed.
 
-### b) Agent namespace permissions ✅
+### b) Agent namespace permissions ✅ RESOLVED
 
-Set `agent.namespace` to `"search-discovery"` — this is where the service has RBAC permissions to create pods.
+The `discovery` IAM role (used via `saml2aws login -a tlb-dev-2`) does **not** have permission to create `jobs.batch` in `search-discovery`. Set `agent.namespace` to `"discovery"` where the role does have batch permissions. mirrord can run its agent in a different namespace than the target — it attaches to the target pod's network via the node, not via namespace.
+
+```bash
+# Verify permissions before running:
+kubectl auth can-i create jobs.batch -n discovery   # should print: yes
+kubectl auth can-i create jobs.batch -n search-discovery  # prints: no
+```
 
 ### c) DNS resolution ✅
 
@@ -154,6 +160,6 @@ istio intercepts traffic before mirrord can inspect HTTP headers. Filtered steal
 | `feature.network.dns` | `true` | Resolve `*.svc.cluster.local` via remote DNS |
 | `feature.fs` | `"local"` | Use local filesystem |
 | `feature.env.exclude` | `"DH_SPEC_FILE"` | Force fallback to local `config/config.yml` |
-| `agent.namespace` | `"search-discovery"` | Create agent pod where we have RBAC permissions |
+| `agent.namespace` | `"discovery"` | Namespace where discovery IAM role has batch/jobs permissions |
 | `agent.privileged` | `true` | Required for DNS resolution on hardened clusters |
 | `kube_context` | `arn:aws:eks:...` | Explicit QA cluster context |
