@@ -85,6 +85,9 @@ make build        # or: go build -o <service-name> .
 
 Make sure the binary exists locally before running `tlbctl exec`.
 
+If your service loads Go plugins (`.so`), build those too — see [Lura gateways with
+plugins](#lura-gateways-with-plugins).
+
 ---
 
 ## Step 5 — Run with tlbctl exec
@@ -134,17 +137,120 @@ saml2aws login -a tlb-prd-2 --role arn:aws:iam::457710302499:role/search-discove
   -- ./personalisation-platform-service
 ```
 
-**talabat-home-api-gateway** (Deployment, discovery) — QA:
+**talabat-home-api-gateway** (Deployment, discovery)
+
+This one is more involved than a plain service: it is a Lura/KrakenD gateway that
+loads Go **plugins** (`.so`) and reads **three** config files, all of which point at
+container paths that do not exist on your laptop. See
+[Lura gateways with plugins](#lura-gateways-with-plugins) for the why.
+
+QA:
 ```bash
 cd ~/Documents/talabat/home/talabat-home-api-gateway
-make build-lura-fast
+
+# 1. Build the binary AND the plugins (must be built together — see note below)
+make build-lura-fast && make build-plugins-fast
+
+# 2. Patch the plugin folder: /etc/lura/plugins/ -> ./bin/
+python3 -c "
+import json, pathlib
+d = json.load(open('configs/lura.qa.json'))
+d['plugin']['folder'] = './bin/'
+pathlib.Path('/tmp/lura.qa.local.json').write_text(json.dumps(d))
+"
+
+# 3. Run
 ~/Documents/talabat/tools/tlbctl/bin/tlbctl exec \
   --context 2a \
   -n discovery \
   --as deploy/talabat-home-api-gateway \
-  --set LURA_CONFIG_FILE=./configs/lura.qa.json \
+  --set LURA_CONFIG_FILE=/tmp/lura.qa.local.json \
   --set APP_CONFIG_FILE=./configs/app_configs/app.qa.json \
+  --set RULE_ENGINE_CONFIG_FILE=./configs/rule_engine_config.qa.json \
   -- ./bin/talabat-home-api-gateway
+```
+
+Production — identical, with `prod` configs and the prod context:
+```bash
+saml2aws login -a tlb-prd-2 --role arn:aws:iam::457710302499:role/discovery --force
+
+cd ~/Documents/talabat/home/talabat-home-api-gateway
+make build-lura-fast && make build-plugins-fast
+
+python3 -c "
+import json, pathlib
+d = json.load(open('configs/lura.prod.json'))
+d['plugin']['folder'] = './bin/'
+pathlib.Path('/tmp/lura.prod.local.json').write_text(json.dumps(d))
+"
+
+~/Documents/talabat/tools/tlbctl/bin/tlbctl exec \
+  --context talabat-prod-main-cluster \
+  -n discovery \
+  --as deploy/talabat-home-api-gateway \
+  --set LURA_CONFIG_FILE=/tmp/lura.prod.local.json \
+  --set APP_CONFIG_FILE=./configs/app_configs/app.prod.json \
+  --set RULE_ENGINE_CONFIG_FILE=./configs/rule_engine_config.prod.json \
+  -- ./bin/talabat-home-api-gateway
+```
+
+Only steps 2–3 need re-running between runs; rebuild only when you change code.
+
+---
+
+## Lura gateways with plugins
+
+Three things bite you on a plugin-based gateway that do not apply to a normal service.
+
+### 1. Plugins must be built with the binary, with matching flags
+
+`make build-lura-fast` only builds the gateway. The `.so` files come from a separate
+target:
+
+```bash
+make build-lura-fast && make build-plugins-fast
+```
+
+Go requires plugins and host binary to agree on Go version, dependency versions, **and
+compiler flags**. The `-fast` targets both use `-ldflags="-s -w" -gcflags="all=-l"`, so
+they pair correctly. Do **not** mix targets — `make build-lura` + `make
+build-plugins-fast` will fail at `plugin.Open` with a "different version of package"
+error.
+
+### 2. `plugin.folder` is inside the JSON — `--set` cannot reach it
+
+The config hardcodes the container path:
+
+```json
+"plugin": { "folder": "/etc/lura/plugins/", "pattern": ".so" }
+```
+
+That is a JSON field, not an env var, so there is no `--set` for it. Write a patched
+copy to `/tmp` and point `LURA_CONFIG_FILE` at that (see the recipe above).
+
+### 3. There are three config env vars, not two
+
+`RULE_ENGINE_CONFIG_FILE` is easy to miss because it fails **later** than the other two
+— the gateway starts, then errors when a rule is first evaluated. Override all three:
+
+```bash
+--set LURA_CONFIG_FILE=/tmp/lura.prod.local.json \
+--set APP_CONFIG_FILE=./configs/app_configs/app.prod.json \
+--set RULE_ENGINE_CONFIG_FILE=./configs/rule_engine_config.prod.json
+```
+
+### Verifying plugins actually loaded
+
+Successful startup logs — if you see these, plugins are fine and any 404 is a
+**routing** problem, not a loading one:
+
+```
+home aggregator loaded
+template home aggregator loaded
+Total client plugins loaded: 1
+Total handler plugins loaded: 2
+[PLUGIN: Server] Injecting plugin homeaggregator
+[PLUGIN: Server] Injecting plugin templateaggregator
 ```
 
 ---
@@ -223,16 +329,49 @@ If you still see it, your saml2aws session might have expired. Re-login and rebu
 
 ### 404 on curl to a Lura/KrakenD gateway
 
-Lura routes use **path parameters**, not query params. Check `configs/lura.qa.json` for the actual route pattern:
+First confirm plugins loaded (see [Verifying plugins actually
+loaded](#verifying-plugins-actually-loaded)). If they did, this is a routing mismatch,
+not a plugin problem.
+
+Dump the routes the running config actually registers:
 
 ```bash
 python3 -c "
 import json
-d=json.load(open('configs/lura.qa.json'))
+d=json.load(open('configs/lura.prod.json'))
 for e in d.get('endpoints', []):
-    print(e['endpoint'])
+    print(e.get('method','GET'), e['endpoint'])
 "
 ```
+
+**The `v1` vs `v2` trap.** On talabat-home-api-gateway the registered route is:
+
+```
+GET /home/v2/{country_code}/content/{device_source}/{lat}/{lon}/{area_id}/{country_id}/{address_id}
+```
+
+but the natural thing to curl is `/home/v1/ae/content?lat=...&lon=...`, which 404s. The
+`homeaggregator` server plugin rewrites query params into **path segments** — appending
+`device_source/lat/lon/area_id/country_id/address_id` onto whatever prefix you send. It
+does not rewrite `v1` to `v2`. So send `v2` and let the plugin build the rest:
+
+```bash
+curl --location 'localhost:8080/home/v2/ae/content?countryId=4&area_id=1244&lat=25.218979394147638&lon=55.26518683611329' \
+  --header 'X-Device-Source: 4' \
+  --header 'X-Device-Version: 11.27.0' \
+  --header 'X-Device-Framework: Flutter' \
+  --header 'X-Device-Width: 400' \
+  --header 'AppBrand: 1' \
+  --header 'BrandType: 1' \
+  --header 'Accept-Language: en-US' \
+  --header 'X-Device-ID: 70C1DDFA-744D-4107-AC2A-BC030F3C21C5' \
+  --header 'X-PerseusClientId: 1632821284775.1682808939.pcqscvuyjf' \
+  --header 'X-PerseusSessionId: 1632822120625.8832869075.bkheoxpobq'
+```
+
+`X-Device-Source` is required — the plugin maps it to a path segment and only accepts
+the iOS/Android values; anything else yields an empty segment and a 400 (`Device Source
+cannot be empty!`). `lat`, `lon` and `area_id` are validated the same way.
 
 ---
 
